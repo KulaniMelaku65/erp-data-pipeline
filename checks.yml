@@ -1,0 +1,71 @@
+# Data-quality checks run after every transform.
+# severity: error  -> the run fails (exit code 1) and nothing downstream should trust the data
+# severity: warn   -> logged and reported, but the run succeeds
+checks:
+  # --- keys -------------------------------------------------------------------
+  - {name: dim_customer_id_unique, type: unique, table: dim_customer, column: customer_id, severity: error}
+  - {name: dim_item_id_unique, type: unique, table: dim_item, column: item_id, severity: error}
+  - {name: fact_sales_line_unique, type: unique, table: fact_sales, column: line_id, severity: error}
+  - {name: fact_gl_entry_unique, type: unique, table: fact_gl, column: entry_no, severity: error}
+  - {name: fact_sales_customer_not_null, type: not_null, table: fact_sales, column: customer_id, severity: error}
+  - {name: fact_sales_item_not_null, type: not_null, table: fact_sales, column: item_id, severity: error}
+
+  # --- relationships ---------------------------------------------------------------
+  - {name: fact_sales_customer_exists, type: relationship, table: fact_sales, column: customer_id,
+     to_table: dim_customer, to_column: customer_id, severity: error}
+  - {name: fact_sales_item_exists, type: relationship, table: fact_sales, column: item_id,
+     to_table: dim_item, to_column: item_id, severity: error}
+  - {name: fact_gl_account_exists, type: relationship, table: fact_gl, column: account_no,
+     to_table: dim_account, to_column: account_no, severity: error}
+  - {name: fact_gl_date_exists, type: relationship, table: fact_gl, column: date_key,
+     to_table: dim_date, to_column: date_key, severity: error}
+
+  # --- accounting rules --------------------------------------------------------------
+  - name: gl_document_balances
+    description: Every posted document must have debits equal to credits.
+    type: sql
+    severity: error
+    sql: |
+      SELECT document_no FROM fact_gl
+      GROUP BY document_no
+      HAVING ABS(SUM(debit) - SUM(credit)) > 0.005
+
+  - name: trial_balance_zero
+    description: Total debits equal total credits across the whole ledger.
+    type: sql
+    severity: error
+    sql: |
+      SELECT total FROM (SELECT SUM(debit) - SUM(credit) AS total FROM fact_gl) t
+      WHERE ABS(total) > 0.005
+
+  - name: invoice_header_matches_lines
+    description: An invoice's amount excluding tax equals the sum of its item lines.
+    type: sql
+    severity: error
+    sql: |
+      SELECT i.invoice_no FROM stg_sales_invoices i
+      JOIN (SELECT invoice_id, SUM(net_amount) AS lines_total
+            FROM stg_sales_invoice_lines GROUP BY invoice_id) l ON l.invoice_id = i.invoice_id
+      WHERE ABS(i.total_excl_tax - l.lines_total) > 0.01
+
+  - name: sales_reconcile_to_revenue_account
+    description: Net sales in fact_sales equal credits on the revenue account (4100).
+    type: sql
+    severity: error
+    sql: |
+      SELECT s.total, g.total FROM
+        (SELECT SUM(net_amount) AS total FROM fact_sales) s,
+        (SELECT SUM(credit) - SUM(debit) AS total FROM fact_gl WHERE account_no = '4100') g
+      WHERE ABS(s.total - g.total) > 0.05
+
+  # --- reasonableness ------------------------------------------------------------------
+  - name: no_negative_quantities
+    type: sql
+    severity: warn
+    sql: SELECT line_id FROM fact_sales WHERE quantity <= 0
+
+  - name: margin_not_below_minus_50_percent
+    description: Flags lines sold far below cost, usually a wrong price or cost.
+    type: sql
+    severity: warn
+    sql: SELECT line_id FROM fact_sales WHERE net_amount > 0 AND gross_margin < -0.5 * net_amount
